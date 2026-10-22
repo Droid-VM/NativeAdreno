@@ -109,9 +109,11 @@ struct NativeAdrenoAskerRecord native_adreno_metal_askers[12];
  * wallpaper, iconservicesagent for the icons, WidgetRenderer_Default for the widgets: int-196's screen pictures showed a black wallpaper and white widget
  * boxes, none of which had a native device), 170 MiB each (page aligned). int-198: iconservicesagent reached 128 MiB into its window and then lost its
  * Metal device; whether the window is the cause is what the [gpu windows] log row decides before these sizes change. */
+/* int-240: the render server reached 1523 MiB of its window's 1536 MiB end. With the 4 GiB aperture (gDeviceInfo 0x20000000..0x100000000) slot 0
+ * gets 2.5 GiB and the three others 341 MiB each (page aligned). */
 enum : unsigned {NativeAdrenoMaxClients=4};
 static const struct {uint64_t start,bytes;} kClientWindows[NativeAdrenoMaxClients]={
-    {0x20000000ull,0x40000000ull},{0x60000000ull,0x0AAA9000ull},{0x6AAA9000ull,0x0AAA9000ull},{0x75552000ull,0x0AAA9000ull}};
+    {0x20000000ull,0xA0000000ull},{0xC0000000ull,0x15555000ull},{0xD5555000ull,0x15555000ull},{0xEAAAA000ull,0x15555000ull}};
 
 namespace {
 void shiftName(char names[3][17]) {

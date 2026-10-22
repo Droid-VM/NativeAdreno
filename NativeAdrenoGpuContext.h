@@ -15,7 +15,7 @@
  * a matching non-cacheable view. Bank, ASID, SMR slots and stream IDs are caller inputs. Nothing is torn down. */
 enum : uint64_t {
     GpuSqeIova=0x100000, GpuRingIova=0x200000, GpuMemptrsIova=0x300000, GpuPwrupIova=0x301000,
-    GpuScratchIova=0x302000, GpuApertureBytes=0x80000000
+    GpuScratchIova=0x302000, GpuApertureBytes=0x100000000
 };
 enum : size_t {GpuSqeBytes=0x13000, GpuRingBytes=0x8000, GpuPageBytes=0x1000, GpuBufferCount=5};
 struct NativeAdrenoGpuBuffer {uint64_t physical,bytes,iova;};
@@ -24,12 +24,14 @@ class NativeAdrenoGpuContext final {
     uint64_t handles_[GpuBufferCount]{};
     NativeAdrenoSmmuContext smmu_;
     NativeAdrenoVm vm_;
-    /* The alias checks' sort scratch: one entry per range of the smaller compared side, at most half the aperture's leaves. */
-    uint32_t alias_scratch_[NativeAdrenoSmmuContext::MaxLeaves/2];
+    /* The alias checks' sort scratch: one entry per range of the smaller compared side, which the VM's range capacity (131072) bounds. */
+    uint32_t alias_scratch_[size_t(1)<<18];
     bool ready_=false,used_=false;
 public:
     enum Step : uint32_t {Allocate=1,Prepare,Program,Attach,VmAttach,Map,Ready};
-    enum : size_t {TablePages=1027};
+    /* The 4 GiB aperture fully mapped: one level-1 page, four level-2 pages and 2048 level-3 pages (the 2 GiB one needed 1027; the render
+     * server's window reached 1523 of its 1536 MiB in int-240). */
+    enum : size_t {TablePages=2053};
     NativeAdrenoGpuContext()=default;
     NativeAdrenoGpuContext(const NativeAdrenoGpuContext &)=delete;
     NativeAdrenoGpuContext &operator=(const NativeAdrenoGpuContext &)=delete;
