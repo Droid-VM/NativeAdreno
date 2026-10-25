@@ -27,7 +27,8 @@ enum {
     DROIDVM_VIRTGPU_WAIT_FENCE = 6,
     DROIDVM_VIRTGPU_RESOURCE_INFO = 7,
     DROIDVM_VIRTGPU_GEM_CLOSE = 8,
-    DROIDVM_VIRTGPU_OPS = 9,
+    DROIDVM_VIRTGPU_CREATE_BLOB_USER = 9,
+    DROIDVM_VIRTGPU_OPS = 10,
 
     /* GETPARAM: the VIRTGPU_PARAM_* numbers, and this ABI's version. */
     DROIDVM_VIRTGPU_PARAM_3D_FEATURES = 1,
@@ -59,7 +60,14 @@ struct droidvm_virtgpu_create_blob {                                          /*
     uint64_t size, blob_id;
     uint32_t cmd_size, pad;
 };
-struct droidvm_virtgpu_create_blob_reply { uint32_t handle, resource_id; };
+struct droidvm_virtgpu_create_blob_reply { uint32_t handle, resource_id; };   /* CREATE_BLOB, CREATE_BLOB_USER */
+/* CREATE_BLOB_USER: a HOST3D_GUEST blob over the caller's own pages, [address, address + size), 4 KiB aligned (an IOSurface's:
+ * VK_EXT_external_memory_host). The kernel wires them until GEM_CLOSE; the caller keeps its own mapping, so it is not MAPped.
+ * Followed by cmd_size bytes of ccmd (the GEM_NEW that gives the BO its address). */
+struct droidvm_virtgpu_create_blob_user {
+    uint64_t address, size, blob_id;
+    uint32_t blob_flags, cmd_size;
+};
 struct droidvm_virtgpu_handle { uint32_t handle, pad; };                      /* MAP, RESOURCE_INFO, GEM_CLOSE */
 struct droidvm_virtgpu_map_reply { uint64_t address, size; };
 struct droidvm_virtgpu_execbuffer { uint32_t flags, ring_idx, size, pad; };   /* followed by size bytes of commands */
