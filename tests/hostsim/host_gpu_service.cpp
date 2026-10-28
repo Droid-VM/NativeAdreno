@@ -13,9 +13,12 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
+#include <unistd.h>
 
 IOReturn NativeAdrenoQueryCpu4K(NativeAdrenoCpuState *state) {*state={};return kIOReturnSuccess;}
 IOReturn NativeAdrenoMaintainOwnedPages(void *,size_t,NativeAdrenoCacheOperation) {return kIOReturnSuccess;}
+/* The kernel's proc_selfpid (the user client records the owner of a live import); here the simulating process is the caller. */
+extern "C" int proc_selfpid(void) {return getpid();}
 
 namespace {
 constexpr size_t kSmmuBytes=0x40000;
