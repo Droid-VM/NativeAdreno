@@ -553,8 +553,12 @@ IOReturn AGXDeviceUserClient::externalMethod(uint32_t selector,IOExternalMethodA
      * so which selector numbers reach this object is decided outside the driver. A tunnel call carries the real ABI method in its
      * first eight bytes and may use ANY admitted selector: {magic, method, payload...} in, the method's exact output out. Method
      * 0xffffffff is a probe that only proves the selector was admitted. */
-    /* An input longer than IOKit passes inline (4096 bytes: a virtgpu command) arrives as memory of the caller's: read it here. */
-    if(arguments && !arguments->structureInput && arguments->structureInputDescriptor) {
+    /* An input longer than IOKit passes inline (4096 bytes: a virtgpu command) arrives as memory of the caller's: read it here. Its
+     * structureInput is NOT null then (is_io_connect_method points it at the empty inband buffer, structureInputSize 0): testing it
+     * for null refused every such command as an unknown selector, kIOReturnUnsupported -- a submission of a heavy frame (over ~83
+     * command buffers: the wallpaper editor, Stage Manager), which Turnip took for a lost device, and Core Animation then ended
+     * backboardd. */
+    if(arguments && arguments->structureInputDescriptor && !arguments->structureInputSize) {
         IOMemoryDescriptor *memory=arguments->structureInputDescriptor;
         const IOByteCount size=memory->getLength();
         if(size<8 || size>NativeAdrenoTunnelMaxInput)return kIOReturnBadArgument;
