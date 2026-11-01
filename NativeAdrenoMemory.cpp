@@ -5,6 +5,7 @@ extern "C" {volatile uint32_t native_adreno_trace_stage;}
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOLib.h>
 #include <kern/task.h>
+extern "C" boolean_t PE_parse_boot_argn(const char *,void *,int);
 
 static bool outputWidth(unsigned bits)
 {return bits==32 || bits==36 || bits==40 || bits==42 || bits==44 || bits==48;}
@@ -14,6 +15,8 @@ extern "C" {volatile uint32_t native_adreno_import_stage;volatile uint64_t nativ
 /* BO memory for the board log: [0] user BOs from the system (allocateSystem), [1] their spans, [2] refused, [3] the last refusal's status,
  * [4] MiB of them live, [5] the peak, [6] kernel-mapped BOs (allocate), [7] import spans. */
 extern "C" {volatile uint32_t native_adreno_bo_memory[8];}
+/* Contiguous BO runs: [0] made, [1] refused by the free memory (those BOs fell back to pageable pages). */
+extern "C" {volatile uint32_t native_adreno_bo_contig[2];}
 namespace {
 uint64_t systemBytes,systemPeak;
 bool pressure;
@@ -110,30 +113,92 @@ failed:
      * as success. No object has been exposed to a GPU or userspace yet. */
     (void)release();return status;
 }
-IOReturn NativeAdrenoMemory::allocateSystem(size_t bytes,unsigned bits,size_t budget,bool write_combined)
+/* No task: the memory is mapped nowhere until a client view maps it. The cache mode is the memory entry's, so every mapping of it (the
+ * client views) and the pages themselves take it. */
+static IOBufferMemoryDescriptor *systemDescriptor(size_t bytes,bool write_combined,uint64_t *made=nullptr,uint64_t *wired=nullptr)
+{
+    IOOptionBits options=static_cast<IOOptionBits>(kIODirectionInOut)|static_cast<IOOptionBits>(kIOMemoryMapperNone)|
+        static_cast<IOOptionBits>(kIOMemoryPageable);
+    if(write_combined)options|=kIOMapWriteCombineCache;
+    /* Pageable pages arrive one by one (a BO averaged 69 spans); from `sheng-gpu-bo-contig` KiB up to 128 KiB a BO first asks for one
+     * physically contiguous run (one span, one table walk), and a request the free memory cannot serve falls back to pageable pages.
+     * A contiguous request the kernel cannot serve scans every free page before it gives up: in ibb10331f24 124 such searches (0.1 to
+     * 64 MiB) took 163 ms each at the median and 21.7 s in all, synchronously in the caller (the render server's and the widget
+     * renderer's allocations, the stalls at an app launch and on the widget page), while every success was 64 to 128 KiB. So larger
+     * BOs never ask, and after a failure no request of that size or larger asks again for 5 s. */
+    static uint32_t contigKiB=UINT32_MAX;
+    if(contigKiB==UINT32_MAX) {contigKiB=0;PE_parse_boot_argn("sheng-gpu-bo-contig",&contigKiB,sizeof contigKiB);}
+    static const size_t contigMax=size_t(128)*1024;
+    static size_t failedBytes=0;
+    static uint64_t failedAt=0,backoff=0;
+    if(!backoff)nanoseconds_to_absolutetime(UINT64_C(5000000000),&backoff);
+    const uint64_t now=mach_absolute_time();
+    if(failedBytes && now-failedAt>=backoff)failedBytes=0;
+    if(contigKiB && bytes>=size_t(contigKiB)*1024 && bytes<=contigMax && !(failedBytes && bytes>=failedBytes)) {
+        IOBufferMemoryDescriptor *run=IOBufferMemoryDescriptor::inTaskWithPhysicalMask(nullptr,
+            (options&~static_cast<IOOptionBits>(kIOMemoryPageable))|static_cast<IOOptionBits>(kIOMemoryPhysicallyContiguous),bytes,UINT64_C(0xfffffffff000));
+        if(run && run->prepare()==kIOReturnSuccess) {native_adreno_bo_contig[0]=native_adreno_bo_contig[0]+1;return run;}
+        if(run)run->release();
+        native_adreno_bo_contig[1]=native_adreno_bo_contig[1]+1;
+        if(!failedBytes || bytes<failedBytes)failedBytes=bytes;
+        failedAt=now;
+    }
+    IOBufferMemoryDescriptor *descriptor=IOBufferMemoryDescriptor::inTaskWithOptions(nullptr,options,bytes,4096);
+    if(made)*made=mach_absolute_time();
+    if(descriptor && descriptor->prepare()!=kIOReturnSuccess) {descriptor->release();descriptor=nullptr;}
+    if(wired)*wired=mach_absolute_time();
+    return descriptor;
+}
+IOReturn NativeAdrenoMemory::prepareSystem(size_t bytes,bool write_combined,NativeAdrenoSystemPages *out)
+{
+    if(!out || out->descriptor || !bytes || (bytes&4095))return kIOReturnBadArgument;
+    uint64_t made=0,wired=0;
+    IOBufferMemoryDescriptor *descriptor=systemDescriptor(bytes,write_combined,&made,&wired);
+    if(!descriptor)return kIOReturnNoMemory;
+    if(!made)made=wired=mach_absolute_time();   /* a contiguous run: made and wired in one step */
+    if(descriptor->getLength()!=bytes) {descriptor->complete();descriptor->release();return kIOReturnUnsupported;}
+    bool cleaned=false;
+    /* Default-attribute pages may still hold the zero fill in a CPU's cache: written back here, by physical runs, as allocateSystem would. */
+    if(!write_combined) {
+        cleaned=true;
+        for(size_t offset=0;offset<bytes && cleaned;) {
+            IOByteCount length=0;
+            const addr64_t physical=descriptor->getPhysicalSegment(offset,&length,kIOMemoryMapperNone);
+            if(!physical || (physical&4095) || length<4096) {cleaned=false;break;}
+            if(length>bytes-offset)length=bytes-offset;
+            length&=~IOByteCount(4095);
+            if(NativeAdrenoMaintainPhysicalPages(physical,length,NativeAdrenoClean)!=kIOReturnSuccess)cleaned=false;
+            offset+=length;
+        }
+        if(cleaned)NativeAdrenoNotePhase(NativeAdrenoPhaseAllocate,bytes);
+    }
+    out->descriptor=descriptor;out->bytes=bytes;out->write_combined=write_combined;out->cleaned=cleaned;out->made=made;out->wired=wired;
+    return kIOReturnSuccess;
+}
+void NativeAdrenoMemory::discardSystem(NativeAdrenoSystemPages *pages)
+{
+    if(!pages || !pages->descriptor)return;
+    pages->descriptor->complete();pages->descriptor->release();
+    *pages=NativeAdrenoSystemPages{};
+}
+IOReturn NativeAdrenoMemory::allocateSystem(size_t bytes,unsigned bits,size_t budget,bool write_combined,NativeAdrenoSystemPages *prepared)
 {
     if(descriptor_ || spans_ || quarantined_)return kIOReturnBusy;
     if(!bytes || (bytes&4095) || !outputWidth(bits) || !budget)return kIOReturnBadArgument;
     if(bytes>budget)return kIOReturnNoResources;
     NativeAdrenoCpuState cpu{};
     IOReturn status=NativeAdrenoQueryCpu4K(&cpu);if(status!=kIOReturnSuccess)return status;
-    /* No task: the memory is mapped nowhere until a client view maps it. The cache mode is the memory entry's, so every mapping of it
-     * (the client views) and the pages themselves take it. */
-    IOOptionBits options=static_cast<IOOptionBits>(kIODirectionInOut)|static_cast<IOOptionBits>(kIOMemoryMapperNone)|
-        static_cast<IOOptionBits>(kIOMemoryPageable);
-    if(write_combined)options|=kIOMapWriteCombineCache;
-    descriptor_=IOBufferMemoryDescriptor::inTaskWithOptions(nullptr,options,bytes,4096);
-    status=kIOReturnNoMemory;
-    if(descriptor_) {
-        system_=true;
-        status=descriptor_->prepare();
-        if(status!=kIOReturnSuccess) {descriptor_->release();descriptor_=nullptr;system_=false;}
-    }
+    /* Pages prepared outside the lock for this very request are taken over; any other request makes its own. */
+    bool cleaned=false;
+    if(prepared && prepared->descriptor && prepared->bytes==bytes && prepared->write_combined==write_combined) {
+        descriptor_=prepared->descriptor;cleaned=prepared->cleaned;*prepared=NativeAdrenoSystemPages{};
+    } else descriptor_=systemDescriptor(bytes,write_combined);
+    status=descriptor_?kIOReturnSuccess:kIOReturnNoMemory;
     if(status==kIOReturnSuccess) {
-        prepared_=true;bytes_=bytes;write_combined_=write_combined;noteSystem((int64_t)bytes);
+        system_=true;prepared_=true;bytes_=bytes;write_combined_=write_combined;noteSystem((int64_t)bytes);
         status=descriptor_->getLength()==bytes?takeSegments(descriptor_,bytes,UINT64_C(1)<<bits,false):kIOReturnUnsupported;
         /* Default-attribute pages may still hold the zero fill in this CPU's cache: written back before the GPU reads them. */
-        if(status==kIOReturnSuccess && !write_combined) {
+        if(status==kIOReturnSuccess && !write_combined && !cleaned) {
             status=maintainImported(0,bytes,NativeAdrenoClean);
             NativeAdrenoNotePhase(NativeAdrenoPhaseAllocate,bytes);
         }
@@ -295,6 +360,14 @@ IOReturn NativeAdrenoMemory::release()
     if(spans_)IODeleteData(spans_,NativeAdrenoPhysicalSpan,span_capacity_);
     mapping_=nullptr;spans_=nullptr;bytes_=span_count_=span_capacity_=0;read_only_=false;owner_uncached_=false;
     return kIOReturnSuccess;
+}
+IOReturn NativeAdrenoMemory::releaseSystemInto(NativeAdrenoSystemPages *out)
+{
+    if(!out || out->descriptor || !system_ || !descriptor_ || !prepared_ || imported_ || device_references_ || quarantined_)return release();
+    /* The GPU no longer maps the pages (the free unmapped them first) and every client view holds the descriptor itself. */
+    out->descriptor=descriptor_;out->bytes=bytes_;out->write_combined=write_combined_;out->cleaned=false;
+    descriptor_=nullptr;prepared_=false;
+    return release();
 }
 IOReturn NativeAdrenoMemory::holdForDevice()
 {

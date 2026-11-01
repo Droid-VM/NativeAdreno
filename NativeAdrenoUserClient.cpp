@@ -1,14 +1,18 @@
 /* SPDX-License-Identifier: MIT */
 #include "NativeAdrenoUserClient.h"
+#include <kern/task.h>
+#include <sys/resource_private.h>   /* PRIO_DARWIN_GPU_*: the process's GPU role, set by the system */
 extern "C" volatile uint32_t native_adreno_trace_stage;
 /* 0 keeps user BOs cacheable and maintained before every submission (int-070..097); the board sets it from the sheng-gpu-wc boot argument. */
 /* sheng-gpu-owned-coherent=1: the GPU's own BOs use the IO-coherent path (CPU write-back view, GPU write-back inner-shareable mapping) instead of
  * write-combine: no write-combined audit and no cache maintenance per submission. Effective only once the board proved IO coherence. */
 extern "C" {volatile uint32_t native_adreno_wc_enabled=1,native_adreno_owned_coherent=0;extern volatile uint32_t native_adreno_io_coherent;}
 static bool ownedCoherent() {return native_adreno_owned_coherent && native_adreno_io_coherent;}
+bool NativeAdrenoUserClient::systemWriteCombined() {return native_adreno_wc_enabled && !ownedCoherent();}
 /* BoImport record: [0] calls, [1] refused, [2..5] last refusal (status, stage, bytes, address), [6..9] first refusal. Stages 1..3 are this file's
  * checks, 10..19 NativeAdrenoMemory::importTask's. */
 extern "C" {volatile uint64_t native_adreno_import_diag[10];}
+/* Imports of 16 MiB or more (the compositor's scanout surfaces), oldest overwritten: per entry the caller's address, the first physical page, the bytes. */
 extern "C" volatile uint32_t native_adreno_import_stage;
 /* Imports and their release (int-233/234: Core Animation's render thread waited in vm_deallocate for pages a kernel wiring held): [0] imports
  * alive, [1] frees of an import refused, [2] last refusal status; then the 8 newest imports as {address, pid<<40|bytes, handle, state}, state
@@ -241,14 +245,14 @@ IOReturn NativeAdrenoUserClient::allocBoInner(const NativeAdrenoAbiBoAlloc *requ
     /* User BOs are write-combined for the CPU, as the GPU maps them non-cacheable: no per-submission cache maintenance.
      * int-147 kept them cacheable under IO coherence and mapped the GPU side write-back: the first Turnip IB executed zeros and the GPU hung
      * (the kernel's cacheable alias read zeros past the first line too). A coherent own BO needs a client that asks for a write-back view. */
-    const bool write_combined=native_adreno_wc_enabled && !ownedCoherent();
+    const bool write_combined=systemWriteCombined();
     IOReturn status;
     if(request->contiguous) {
         /* Only a caller that needs one physical run gets the kernel's contiguous allocation (XNU scans physical memory for it). */
         status=entry->memory.allocate((size_t)request->bytes,output_bits_,true,(size_t)request->bytes);
         if(!status && write_combined)status=entry->memory.makeWriteCombined();
     }
-    else status=entry->memory.allocateSystem((size_t)request->bytes,output_bits_,(size_t)request->bytes,write_combined);
+    else status=entry->memory.allocateSystem((size_t)request->bytes,output_bits_,(size_t)request->bytes,write_combined,offered_pages_);
     if(status) {
         /* A failed allocation can leave quarantine behind; never reuse it. */
         clear(*entry);
@@ -360,7 +364,7 @@ IOReturn NativeAdrenoUserClient::freeBo(const NativeAdrenoAbiBoFree *request)
         entry->mapped_state=false;entry->mapped=0;entry->iova=0;
     }
     const size_t bytes=entry->memory.bytes();
-    const IOReturn release=entry->memory.release();
+    const IOReturn release=freed_pages_?entry->memory.releaseSystemInto(freed_pages_):entry->memory.release();
     if(release) {noteFreeRefused(entry->imported,entry->handle,release);return release;}
     if(!entry->imported) {
         owned_bytes_-=bytes<owned_bytes_?bytes:owned_bytes_;
@@ -368,6 +372,37 @@ IOReturn NativeAdrenoUserClient::freeBo(const NativeAdrenoAbiBoFree *request)
     }
     if(entry->imported) {native_adreno_import_live[0]=native_adreno_import_live[0]-1;noteImportState(entry->handle,2);}
     clear(*entry);
+    return kIOReturnSuccess;
+}
+/* The GPU priority this process's next submission takes: its queues' foreground value while it renders visible UI (any GPU role above
+ * background), their background value otherwise. A process that never told us keeps the daemon's default (no ring choice). */
+/* Which processes told the driver what (the newest 32): pid, foreground priority, background priority, the GPU role then, the time (ms of
+ * the submission clock when the board gave one, else 0) and how many times this connection had told it before (0 the runtime's first call
+ * at device open, later ones the process's own setGPUPriority:/setBackgroundGPUPriority: through the frontend). */
+extern "C" {volatile uint32_t native_adreno_prio_log[32][6];volatile uint32_t native_adreno_prio_count;}
+extern "C" uint64_t native_adreno_now_us(void) __attribute__((weak));
+int32_t NativeAdrenoUserClient::submitPriority() const
+{
+    if(priority_foreground_<0 && priority_background_<0)return -1;
+    const int32_t role=task_get_gpu_role(current_task());
+    const bool background=role==PRIO_DARWIN_GPU_BACKGROUND || role==PRIO_DARWIN_GPU_UTILITY;
+    return background?(priority_background_>=0?priority_background_:priority_foreground_)
+                     :(priority_foreground_>=0?priority_foreground_:priority_background_);
+}
+IOReturn NativeAdrenoUserClient::setPriority(uint32_t foreground,uint32_t background)
+{
+    if(!open_)return kIOReturnNotReady;
+    if(foreground>5 || background>5 || foreground==3)return kIOReturnBadArgument;
+    priority_foreground_=int32_t(foreground);
+    priority_background_=int32_t(background);
+    {
+        const uint32_t n=native_adreno_prio_count;
+        volatile uint32_t *row=native_adreno_prio_log[n&31];
+        row[0]=uint32_t(proc_selfpid());row[1]=foreground;row[2]=background;row[3]=uint32_t(task_get_gpu_role(current_task()));
+        row[4]=&native_adreno_now_us?uint32_t(native_adreno_now_us()/1000):0;row[5]=priority_told_;
+        native_adreno_prio_count=n+1;
+        if(priority_told_<0xffffffffu)++priority_told_;
+    }
     return kIOReturnSuccess;
 }
 IOReturn NativeAdrenoUserClient::submit(const NativeAdrenoAbiSubmit *request,
@@ -398,6 +433,9 @@ IOReturn NativeAdrenoUserClient::submit(const NativeAdrenoAbiSubmit *request,
     uint32_t fence=0;
     used_=true;
     ring_->useContext(context_);
+    submit_->nextOwner(proc_selfpid());
+    submit_->nextPriority(submitPriority());
+    submit_->nextRole(task_get_gpu_role(current_task()));
     const IOReturn status=submit_->submit(vm_,buffers,request->buffer_count,
         queue_base_+request->queue,&fence,clock);
     if(status)return status;
